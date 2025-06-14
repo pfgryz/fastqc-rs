@@ -66,43 +66,14 @@ pub(crate) fn process<P: AsRef<Path> + AsRef<OsStr>>(
     k: u8,
     summary: Option<P>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut mean_read_qualities = HashMap::default();
-    let mut base_count = HashMap::default();
     let mut base_quality_count = HashMap::default();
-    let mut read_lengths = HashMap::default();
-    let mut kmers = HashMap::default();
-    let mut gc_content = vec![0_usize; 101];
-    let mut read_count = 0_u64;
+
     let mut reader = parse_fastx_file(&filename).expect("Invalid path/file");
     let mut broken_read = false;
 
     // Gather data from every record
     while let Some(record) = reader.next() {
         if let Ok(seqrec) = record {
-            read_count += 1;
-
-            let sequence = seqrec.seq();
-            let count_read_length = read_lengths.entry(sequence.len()).or_insert_with(|| 0_u64);
-            *count_read_length += 1;
-
-            let gc = sequence
-                .iter()
-                .filter(|&&b| b == b'G' || b == b'g' || b == b'C' || b == b'c')
-                .count();
-            let without_n = sequence.iter().filter(|&&b| b != b'N' || b != b'n').count();
-            gc_content[gc * 100 / without_n] += 1;
-
-            let mean_read_quality = if let Some(qualities) = seqrec.qual() {
-                qualities.iter().map(|q| (q - 33) as u64).sum::<u64>() / qualities.len() as u64
-            } else {
-                0
-            };
-
-            let count_qual = mean_read_qualities
-                .entry(mean_read_quality)
-                .or_insert_with(|| 0);
-            *count_qual += 1;
-
             if let Some(qualities) = seqrec.qual() {
                 for (pos, &q) in qualities.iter().enumerate() {
                     let rec = base_quality_count
@@ -111,158 +82,11 @@ pub(crate) fn process<P: AsRef<Path> + AsRef<OsStr>>(
                     rec[q as usize - 33] += 1;
                 }
             }
-
-            for (pos, base) in sequence.iter().enumerate() {
-                let pos_count = base_count.entry(pos).or_insert_with(|| vec![0_u64; 5]);
-                let i = match base {
-                    b'A' | b'a' => 0,
-                    b'C' | b'c' => 1,
-                    b'G' | b'g' => 2,
-                    b'T' | b't' => 3,
-                    b'N' | b'n' => 4,
-                    _ => panic!("Invalid base"),
-                };
-                pos_count[i] += 1;
-            }
-
-            let norm_seq = seqrec.normalize(false);
-            let rc = norm_seq.reverse_complement();
-            for (_, kmer, _) in norm_seq.canonical_kmers(k, &rc) {
-                let count = kmers.entry(kmer.to_owned()).or_insert_with(|| 0_u64);
-                *count += 1;
-            }
         } else {
             broken_read = true;
         }
     }
-    // Average gc content
-    let avg_gc = {
-        let (sum, len) = gc_content
-            .iter()
-            .enumerate()
-            .fold((0_usize, 0_usize), |(s, l), (gc, n)| (s + gc * n, l + n));
-        sum as f32 / len as f32
-    };
-
-    // Data for base per position
-    let mut n_warn = "pass";
-    let mut base_count_data = Vec::new();
-    let mut base_count_percentage = HashMap::default();
-    let mut gc_content_per_base = HashMap::default();
-    let mut base_warning = "pass";
-    for (position, bases) in base_count {
-        let tmp_sum = bases.iter().sum::<u64>();
-        let tmp_gc = (bases.get(G).unwrap() + bases.get(C).unwrap()) as f64
-            / (tmp_sum - bases.get(N).unwrap()) as f64;
-        gc_content_per_base.insert(position, tmp_gc);
-        base_count_percentage.insert(
-            position,
-            bases
-                .iter()
-                .enumerate()
-                .map(|(b, &count)| {
-                    let (base, pct) = (BASES[b], count as f64 / tmp_sum as f64);
-                    if base == 'N' && pct >= 20_f64 {
-                        n_warn = "fail"
-                    } else if base == 'N' && pct >= 5_f64 && n_warn != "fail" {
-                        n_warn = "warn"
-                    };
-                    (base, pct)
-                })
-                .collect::<HashMap<char, f64>>(),
-        );
-        let gc_diff = i64::abs(*bases.get(G).unwrap() as i64 - *bases.get(C).unwrap() as i64)
-            as f64
-            / tmp_sum as f64;
-        let tg_diff = i64::abs(*bases.get(T).unwrap() as i64 - *bases.get(G).unwrap() as i64)
-            as f64
-            / tmp_sum as f64;
-        if gc_diff >= 20_f64 || tg_diff >= 20_f64 {
-            base_warning = "fail"
-        } else if (gc_diff >= 10_f64 || tg_diff >= 10_f64) && base_warning != "fail" {
-            base_warning = "warn"
-        }
-        for (base, &count) in bases.iter().enumerate() {
-            base_count_data.push(json!({"pos": position, "count": count, "base": BASES[base]}));
-        }
-    }
-
-    let mut bpp_specs: Value =
-        serde_json::from_str(include_str!("report/base_per_pos_specs.json"))?;
-    bpp_specs["data"]["values"] = json!(base_count_data);
-
-    // Data for read lengths
-    let read_length_warn = if read_lengths.len() > 1 {
-        "warn"
-    } else {
-        "pass"
-    };
-    let mut read_length_data = Vec::new();
-    let mut read_length_sum = 0_u64;
-    for (length, count) in &read_lengths {
-        read_length_sum += *length as u64 * *count as u64;
-        read_length_data.push(json!({"length": length, "count": count}));
-    }
-    let avg_read_length = read_length_sum / read_count as u64;
-
-    let mut rle_specs: Value =
-        serde_json::from_str(include_str!("report/read_lengths_specs.json"))?;
-    rle_specs["data"]["values"] = json!(read_length_data);
-
-    // Data for mean read qualities
-    let mut mean_read_quality_data = Vec::new();
-    for (quality, count) in mean_read_qualities {
-        mean_read_quality_data.push(json!({"score": quality, "count": count}))
-    }
-
-    let mut sqc_specs: Value =
-        serde_json::from_str(include_str!("report/sequence_quality_score_specs.json"))?;
-    sqc_specs["data"]["values"] = json!(mean_read_quality_data);
-
-    // Data for kmer quantities
-    let mut kmer_data = Vec::new();
-    for (kmer, count) in &kmers {
-        kmer_data.push(json!({"k_mer": std::str::from_utf8(kmer).unwrap(), "count": count}))
-    }
-
-    let mut overly_represented = Vec::new();
-    let mut overly_represented_warn = "pass";
-    let total_kmers = kmers.iter().map(|(_, count)| count).sum::<u64>();
-    for (km, occ) in kmers
-        .iter()
-        .sorted_by(|(_, a), (_, b)| Ord::cmp(&b, &a))
-        .take(5)
-    {
-        let percentage = *occ as f64 / total_kmers as f64;
-        if percentage >= 1_f64 {
-            overly_represented_warn = "fail";
-            overly_represented.push(json!({"k_mer": std::str::from_utf8(km).unwrap(), "count": occ, "pct": percentage, "or": "Yes"}));
-        } else if percentage >= 0.2_f64 {
-            if overly_represented_warn != "fail" {
-                overly_represented_warn = "warn";
-            }
-            overly_represented.push(json!({"k_mer": std::str::from_utf8(km).unwrap(), "count": occ, "pct": percentage, "or": "No"}));
-        };
-    }
-
-    let mut counter_specs: Value = serde_json::from_str(include_str!("report/counter_specs.json"))?;
-    counter_specs["data"]["values"] = json!(kmer_data);
-
-    // Data for GC content
-    let mut gc_data = Vec::new();
-    // TODO(lhepler): I had to add this filter to get the same histogram in the output report
-    // but I think it may be more correct to leave it out. Arguable, though
-    for (perc, &count) in gc_content
-        .iter()
-        .enumerate()
-        .filter(|(_, &count)| count > 0)
-    {
-        gc_data.push(json!({"gc_pct": perc, "count": count, "type": "gc"}))
-    }
-
-    let mut gc_specs: Value = serde_json::from_str(include_str!("report/gc_content_specs.json"))?;
-    gc_specs["data"]["values"] = json!(gc_data);
-
+   
     // Data for base quality per position
     let mut base_quality_warn = "pass";
     let mut base_per_pos_data = Vec::new();
@@ -294,22 +118,13 @@ pub(crate) fn process<P: AsRef<Path> + AsRef<OsStr>>(
     qpp_specs["data"]["values"] = json!(base_per_pos_data);
 
     let plots = json!({
-        "k-mer quantities": {"short": "count", "specs": counter_specs.to_string()},
-        "gc content": {"short": "gc", "specs": gc_specs.to_string()},
         "base sequence quality": {"short": "base", "specs": qpp_specs.to_string()},
-        "sequence quality score": {"short": "qual", "specs": sqc_specs.to_string()},
-        "base sequence content": {"short": "cont", "specs": bpp_specs.to_string()},
-        "read lengths": {"short": "rlen", "specs": rle_specs.to_string()},
     });
 
     let file = Path::new(&filename).file_name().unwrap().to_str().unwrap();
     let meta = json!({
         "file name": {"name": "file name", "value": file},
         "canonical": {"name": "canonical", "value": "True"},
-        "k": {"name": "k", "value": k},
-        "total reads": {"name": "total reads", "value": read_count},
-        "average GC content": {"name": "average GC content", "value": avg_gc},
-        "average read length": {"name": "average read length", "value": avg_read_length},
     });
 
     let mut templates = Tera::default();
@@ -332,20 +147,6 @@ pub(crate) fn process<P: AsRef<Path> + AsRef<OsStr>>(
             include_str!("report/fastqc_summary.txt.tera"),
         )?;
         context.insert("filename", &file);
-        context.insert("reads", &read_count);
-        context.insert("avg_read_length", &avg_read_length);
-        context.insert("avg_gc", &avg_gc);
-        context.insert("bpp_data", &base_per_pos_data);
-        context.insert("mean_read_quality_data", &mean_read_quality_data);
-        context.insert("base_count", &base_count_percentage);
-        context.insert("base_warning", &base_warning);
-        context.insert("read_lengths", &read_lengths);
-        context.insert("read_length_warn", &read_length_warn);
-        context.insert("gc_data", &gc_data);
-        context.insert("gc_per_base", &gc_content_per_base);
-        context.insert("overly_represented", &overly_represented);
-        context.insert("overly_represented_warn", &overly_represented_warn);
-        context.insert("n_warn", &n_warn);
         context.insert("base_quality_warn", &base_quality_warn);
         let txt = templates.render("fastqc_summary.txt.tera", &context)?;
         let mut file = File::create(output_path.join("fastqc_data.txt"))?;
